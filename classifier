@@ -1,0 +1,119 @@
+import cv2
+import numpy as np
+from PIL import Image
+import io
+import os
+
+# ── Lazy-load YOLOv8 model ───────────────────────────────────────────────────
+_model = None
+MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "models/coconut_best.pt")
+
+GRADES = ["Tender", "Mature", "Ripe", "Defective/Rotten"]
+
+GRADE_META = {
+    "Tender": {
+        "color": "#4ade80",
+        "description": "Young, green, high water content.",
+        "badge": "tender",
+    },
+    "Mature": {
+        "color": "#facc15",
+        "description": "Hard shell, firm white meat.",
+        "badge": "mature",
+    },
+    "Ripe": {
+        "color": "#f97316",
+        "description": "Brown husk, healthy milk inside.",
+        "badge": "ripe",
+    },
+    "Defective/Rotten": {
+        "color": "#ef4444",
+        "description": "Mold, decay, cracks, or damage detected.",
+        "badge": "defective",
+    },
+}
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        try:
+            from ultralytics import YOLO
+            _model = YOLO(MODEL_PATH)
+            print(f"[classifier] Loaded YOLOv8 model from {MODEL_PATH}")
+        except Exception as e:
+            print(f"[classifier] Model not found – falling back to OpenCV heuristic: {e}")
+            _model = "opencv_fallback"
+    return _model
+
+
+def _opencv_heuristic(img_np: np.ndarray) -> tuple[str, float]:
+    """
+    Colour-based heuristic when the trained YOLO model is not yet available.
+    Returns (grade, confidence).
+    """
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    h, s, v = cv2.split(hsv)
+
+    green_mask = cv2.inRange(hsv, (35, 40, 40), (90, 255, 255))
+    brown_mask = cv2.inRange(hsv, (5, 40, 40), (25, 255, 180))
+    dark_mask  = cv2.inRange(hsv, (0, 0, 0), (180, 255, 60))
+
+    total = img_np.shape[0] * img_np.shape[1]
+    green_ratio = cv2.countNonZero(green_mask) / total
+    brown_ratio = cv2.countNonZero(brown_mask) / total
+    dark_ratio  = cv2.countNonZero(dark_mask)  / total
+
+    if dark_ratio > 0.25:
+        return "Defective/Rotten", round(0.55 + dark_ratio * 0.3, 2)
+    if green_ratio > 0.30:
+        return "Tender", round(0.60 + green_ratio * 0.25, 2)
+    if brown_ratio > 0.25:
+        return "Ripe", round(0.60 + brown_ratio * 0.25, 2)
+    return "Mature", 0.65
+
+
+def classify_image(image_bytes: bytes) -> dict:
+    """
+    Classify a single coconut image.
+
+    Returns:
+        {
+            grade: str,
+            confidence: float,
+            details: str,
+            bbox: list | None,   # [x1,y1,x2,y2] normalised 0-1
+        }
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_np = np.array(img)
+
+    model = _get_model()
+
+    if model == "opencv_fallback":
+        grade, confidence = _opencv_heuristic(img_np)
+        bbox = None
+    else:
+        results = model(img_np, verbose=False)[0]
+        if results.boxes and len(results.boxes):
+            box   = results.boxes[0]
+            cls   = int(box.cls[0])
+            grade = GRADES[cls] if cls < len(GRADES) else "Unknown"
+            confidence = float(box.conf[0])
+            # normalise bbox
+            h, w  = img_np.shape[:2]
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            bbox  = [x1 / w, y1 / h, x2 / w, y2 / h]
+        else:
+            grade, confidence = _opencv_heuristic(img_np)
+            bbox = None
+
+    meta = GRADE_META.get(grade, {})
+    return {
+        "grade":      grade,
+        "confidence": round(min(confidence, 1.0), 3),
+        "details":    meta.get("description", ""),
+        "badge":      meta.get("badge", "unknown"),
+        "color":      meta.get("color", "#94a3b8"),
+        "bbox":       bbox,
+    }
